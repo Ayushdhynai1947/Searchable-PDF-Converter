@@ -9,7 +9,7 @@ from flask import Flask, request, send_file, jsonify
 from werkzeug.utils import secure_filename
 import io
 from PIL import Image
-from pdf2image import convert_from_path
+import fitz  # PyMuPDF - No Poppler needed!
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
@@ -187,26 +187,38 @@ class SearchableDocumentConverter:
         return str(output_path)
 
     def convert_pdf_to_searchable_pdf(self, input_pdf_path: str, output_pdf_path: str, dpi: int = 300) -> str:
-        """Convert a scanned PDF to searchable PDF"""
+        """Convert a scanned PDF to searchable PDF using PyMuPDF"""
         logger.info("📚 Converting PDF to searchable PDF")
 
         temp_folder = Path("temp_images")
         temp_folder.mkdir(exist_ok=True)
 
-        images = convert_from_path(input_pdf_path, dpi=dpi)
+        # Open PDF with PyMuPDF
+        pdf_document = fitz.open(input_pdf_path)
         image_paths = []
+        
+        # Convert zoom level based on DPI (default 72 DPI = zoom 1.0)
+        zoom = dpi / 72.0
 
-        for i, img in enumerate(images, start=1):
-            img_path = temp_folder / f"page_{i}.png"
-            img.save(img_path, 'PNG')
+        for page_num, page in enumerate(pdf_document, start=1):
+            logger.info(f"📄 Converting page {page_num}/{len(pdf_document)} to image...")
+            
+            # Render page to image
+            mat = fitz.Matrix(zoom, zoom)
+            pix = page.get_pixmap(matrix=mat, alpha=False)
+            
+            # Save as PNG
+            img_path = temp_folder / f"page_{page_num}.png"
+            pix.save(str(img_path))
             image_paths.append(str(img_path))
 
-        logger.info(f"✅ Converted {len(images)} pages to images")
+        pdf_document.close()
+        logger.info(f"✅ Converted {len(image_paths)} pages to images")
 
         pdf_writer = PdfWriter()
 
         for page_num, img_path in enumerate(image_paths, start=1):
-            logger.info(f"📄 Processing page {page_num}/{len(image_paths)}...")
+            logger.info(f"📄 Processing page {page_num}/{len(image_paths)} for OCR...")
 
             ocr_data = self.extract_text_with_coordinates(img_path)
 
