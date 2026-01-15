@@ -435,7 +435,7 @@
     
 #     app.run(host='0.0.0.0', port=5008, debug=True)
 
-# app.py - Flask API for Searchable PDF Conversion (FIXED)
+# app.py - Flask API for Searchable PDF Conversion (FIXED v2)
 # Run with: python app.py
 # API endpoint: http://localhost:5008/api/convert
 
@@ -492,7 +492,7 @@ class SearchableDocumentConverter:
         self.pdf_format = {'.pdf'}
 
     def extract_text_with_coordinates(self, image_path: str) -> dict:
-        """Extract text and coordinates using Surya OCR - FIXED"""
+        """Extract text and coordinates using Surya OCR"""
         logger.info(f"🔍 Extracting text from: {Path(image_path).name}")
 
         image = Image.open(image_path)
@@ -534,14 +534,11 @@ class SearchableDocumentConverter:
                     
                     x1, y1, x2, y2 = bbox
                     
-                    # FIX: Validate coordinates are within bounds
-                    if x1 < 0 or y1 < 0 or x2 > img_width or y2 > img_height:
-                        logger.debug(f"   Line {idx}: Out of bounds - bbox({x1},{y1},{x2},{y2}) vs img({img_width},{img_height})")
-                        # Clamp to bounds instead of skipping
-                        x1 = max(0, min(x1, img_width))
-                        y1 = max(0, min(y1, img_height))
-                        x2 = max(x1, min(x2, img_width))
-                        y2 = max(y1, min(y2, img_height))
+                    # Clamp coordinates to bounds
+                    x1 = max(0, min(x1, img_width))
+                    y1 = max(0, min(y1, img_height))
+                    x2 = max(x1 + 1, min(x2, img_width))
+                    y2 = max(y1 + 1, min(y2, img_height))
                     
                     bbox_width = x2 - x1
                     bbox_height = y2 - y1
@@ -557,7 +554,7 @@ class SearchableDocumentConverter:
                         'bbox': (x1, y1, x2, y2),
                         'confidence': confidence
                     })
-                    logger.debug(f"   Line {idx}: '{text[:30]}' bbox={bbox_width:.0f}x{bbox_height:.0f}")
+
             else:
                 logger.warning("   No text_lines found in prediction")
         else:
@@ -573,34 +570,42 @@ class SearchableDocumentConverter:
         return result
 
     def create_searchable_pdf_page(self, image_path: str, ocr_data: dict, output_buffer: io.BytesIO) -> io.BytesIO:
-        """Create a single PDF page with invisible text overlay - FIXED"""
+        """Create a single PDF page with invisible text overlay - FIXED v2"""
         image = Image.open(image_path)
+        
+        # Ensure image is RGB (no transparency)
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+            
         img_width, img_height = image.size
 
         pdf_canvas = canvas.Canvas(output_buffer, pagesize=(img_width, img_height))
 
         # Draw the image as background
-        pdf_canvas.drawImage(
-            ImageReader(image),
-            0, 0,
-            width=img_width,
-            height=img_height,
-            preserveAspectRatio=True
-        )
+        try:
+            pdf_canvas.drawImage(
+                ImageReader(image),
+                0, 0,
+                width=img_width,
+                height=img_height,
+                preserveAspectRatio=False
+            )
+            logger.debug("   ✅ Background image drawn successfully")
+        except Exception as e:
+            logger.error(f"   ❌ Failed to draw background image: {e}")
+            return output_buffer
 
         text_count = 0
         skip_count = 0
 
         for element in ocr_data['text_elements']:
-            text = element['text']
+            text = element['text'].strip()
 
-            if not text or not text.strip():
+            if not text:
                 skip_count += 1
                 continue
 
-            bbox = element['bbox']
-            x1, y1, x2, y2 = bbox
-
+            x1, y1, x2, y2 = element['bbox']
             bbox_width = x2 - x1
             bbox_height = y2 - y1
 
@@ -609,41 +614,46 @@ class SearchableDocumentConverter:
                 continue
 
             try:
-                # FIX: Better coordinate conversion
-                # Surya: top-left origin (0,0 at top-left)
-                # ReportLab: bottom-left origin (0,0 at bottom-left)
-                pdf_x = x1
-                pdf_y = img_height - y2  # Convert Y coordinate
+                # CRITICAL FIX: Better coordinate conversion
+                # Surya uses: top-left = (0,0), Y increases downward
+                # ReportLab uses: bottom-left = (0,0), Y increases upward
                 
-                # Ensure text is within bounds
-                if pdf_x < 0 or pdf_y < 0:
-                    logger.debug(f"Text outside bounds: ({pdf_x}, {pdf_y})")
+                # Position text at the top-left of bbox
+                pdf_x = x1
+                pdf_y = img_height - y2  # Convert Y coordinate properly
+                
+                # Ensure position is valid
+                if pdf_x < 0 or pdf_y < 0 or pdf_x >= img_width or pdf_y >= img_height:
+                    logger.debug(f"Text position invalid: ({pdf_x}, {pdf_y}) vs img({img_width}, {img_height})")
                     skip_count += 1
                     continue
 
-                # FIX: Calculate font size more intelligently
-                # Use bbox height, but ensure minimum visibility
-                font_size = max(6, min(bbox_height * 0.85, 72))
+                # CRITICAL: Calculate font size that fits in bbox
+                font_size = max(8, min(bbox_height * 0.9, 72))
 
                 pdf_canvas.saveState()
 
-                # Create text object with invisible rendering
+                # Create text object
                 text_obj = pdf_canvas.beginText(pdf_x, pdf_y)
-                text_obj.setTextRenderMode(3)  # Invisible text (searchable but not visible)
+                
+                # CRITICAL FIX: Use text render mode 3 (invisible but searchable)
+                text_obj.setTextRenderMode(3)
                 text_obj.setFont("Helvetica", font_size)
 
-                # Calculate horizontal scaling to fit text in bbox
+                # Calculate and apply horizontal scaling
                 try:
                     text_width = pdfmetrics.stringWidth(text, "Helvetica", font_size)
                     if text_width > 0 and bbox_width > 0:
                         h_scale = (bbox_width / text_width) * 100
-                        # FIX: Reasonable bounds for horizontal scale
-                        h_scale = max(20, min(300, h_scale))
+                        # Clamp scaling to reasonable range
+                        h_scale = max(25, min(250, h_scale))
                         text_obj.setHorizScale(h_scale)
+                        logger.debug(f"Text scaling: {h_scale:.1f}%")
                 except Exception as e:
-                    logger.debug(f"Could not calculate text width: {e}")
+                    logger.debug(f"Font width calculation failed: {e}")
+                    pass
 
-                # Add text line
+                # Add text - use textLine to ensure it's added
                 text_obj.textLine(text)
                 pdf_canvas.drawText(text_obj)
                 pdf_canvas.restoreState()
@@ -651,11 +661,11 @@ class SearchableDocumentConverter:
                 text_count += 1
 
             except Exception as e:
-                logger.warning(f"Could not add text '{text[:30]}...': {e}")
+                logger.warning(f"Failed to add text '{text[:40]}...': {e}")
                 skip_count += 1
                 continue
 
-        logger.info(f"   ✅ Added {text_count} text elements, skipped {skip_count}")
+        logger.info(f"   ✅ Added {text_count} text elements to overlay, skipped {skip_count}")
 
         pdf_canvas.showPage()
         pdf_canvas.save()
@@ -678,16 +688,17 @@ class SearchableDocumentConverter:
         with open(output_path, 'wb') as f:
             f.write(pdf_buffer.getvalue())
 
-        logger.info(f"✅ Image conversion complete: {ocr_data['total_elements']} text elements")
+        logger.info(f"✅ Image conversion complete: {ocr_data['total_elements']} text elements added")
         return str(output_path)
 
     def convert_pdf_to_searchable_pdf(self, input_pdf_path: str, output_pdf_path: str, dpi: int = 300) -> str:
-        """Convert a scanned PDF to searchable PDF - FIXED with better error handling"""
+        """Convert a scanned PDF to searchable PDF"""
         logger.info("📚 Converting PDF to searchable PDF")
 
         temp_folder = Path("temp_images")
         temp_folder.mkdir(exist_ok=True)
 
+        # Open PDF with PyMuPDF
         pdf_document = fitz.open(input_pdf_path)
         image_paths = []
         
@@ -696,40 +707,44 @@ class SearchableDocumentConverter:
 
         logger.info(f"   Total pages: {total_pages}, DPI: {dpi}, Zoom: {zoom}")
 
-        # Convert all pages to images first
+        # Convert all pages to images
         for page_num, page in enumerate(pdf_document, start=1):
             try:
-                logger.info(f"📄 Converting page {page_num}/{total_pages} to image...")
+                logger.info(f"📄 Rendering page {page_num}/{total_pages}...")
                 
                 mat = fitz.Matrix(zoom, zoom)
+                # Use alpha=False to ensure opaque image
                 pix = page.get_pixmap(matrix=mat, alpha=False)
                 
                 img_path = temp_folder / f"page_{page_num}.png"
                 pix.save(str(img_path))
                 image_paths.append(str(img_path))
-                logger.info(f"   ✅ Page {page_num} image saved")
+                logger.info(f"   ✅ Page {page_num} rendered ({pix.width}x{pix.height})")
                 
             except Exception as e:
-                logger.error(f"   ❌ Failed to convert page {page_num}: {e}")
+                logger.error(f"   ❌ Failed to render page {page_num}: {e}")
                 continue
 
         pdf_document.close()
-        logger.info(f"✅ Converted {len(image_paths)}/{total_pages} pages to images")
-
+        
         if not image_paths:
-            raise ValueError("No pages could be converted from PDF")
+            raise ValueError(f"Failed to extract any pages from PDF")
+            
+        logger.info(f"✅ Extracted {len(image_paths)}/{total_pages} pages as images")
 
         pdf_writer = PdfWriter()
 
         # Process each page for OCR
         for page_num, img_path in enumerate(image_paths, start=1):
             try:
-                logger.info(f"📄 Processing page {page_num}/{len(image_paths)} for OCR...")
+                logger.info(f"📄 Processing page {page_num}/{len(image_paths)} with OCR...")
 
                 ocr_data = self.extract_text_with_coordinates(img_path)
 
                 if ocr_data['total_elements'] == 0:
                     logger.warning(f"   ⚠️  No text detected on page {page_num}")
+                else:
+                    logger.info(f"   📝 Found {ocr_data['total_elements']} text elements")
 
                 page_buffer = io.BytesIO()
                 self.create_searchable_pdf_page(img_path, ocr_data, page_buffer)
@@ -737,22 +752,23 @@ class SearchableDocumentConverter:
                 page_reader = PdfReader(page_buffer)
                 if page_reader.pages:
                     pdf_writer.add_page(page_reader.pages[0])
-                    logger.info(f"   ✅ Page {page_num} OCR complete")
+                    logger.info(f"   ✅ Page {page_num} added to output")
                 else:
-                    logger.error(f"   ❌ Page {page_num}: Failed to create PDF page")
+                    logger.error(f"   ❌ Failed to add page {page_num}")
 
             except Exception as e:
-                logger.error(f"   ❌ Error processing page {page_num}: {e}")
+                logger.error(f"   ❌ Error processing page {page_num}: {e}", exc_info=True)
                 continue
 
         if not pdf_writer.pages:
-            raise ValueError("No pages could be processed successfully")
+            raise ValueError("Failed to process any pages successfully")
 
         # Write final PDF
         with open(output_pdf_path, 'wb') as output_file:
             pdf_writer.write(output_file)
+            logger.info(f"   ✅ PDF file written with {len(pdf_writer.pages)} pages")
 
-        # Cleanup
+        # Cleanup temp images
         for img_path in image_paths:
             try:
                 os.remove(img_path)
@@ -762,7 +778,7 @@ class SearchableDocumentConverter:
         try:
             temp_folder.rmdir()
         except Exception as e:
-            logger.warning(f"Could not remove temp folder: {e}")
+            logger.debug(f"Could not remove temp folder: {e}")
 
         logger.info(f"✅ PDF conversion complete: {len(image_paths)} pages processed")
         return str(output_pdf_path)
@@ -850,7 +866,7 @@ def api_convert():
         output_filename = f"{Path(filename).stem}_searchable.pdf"
         output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
         
-        logger.info(f"Converting: {filename} with DPI: {dpi}")
+        logger.info(f"🚀 Converting: {filename} with DPI: {dpi}")
         converter.convert_to_searchable(input_path, output_path, dpi=dpi)
         
         logger.info(f"✅ Conversion successful")
@@ -863,14 +879,13 @@ def api_convert():
         )
         
     except Exception as e:
-        logger.error(f"Conversion error: {e}", exc_info=True)
+        logger.error(f"❌ Conversion error: {e}", exc_info=True)
         return jsonify({'error': str(e)}), 500
     
     finally:
         if input_path and os.path.exists(input_path):
             try:
                 os.remove(input_path)
-                logger.info(f"Cleaned up input file")
             except Exception as e:
                 logger.warning(f"Could not delete input file: {e}")
 
@@ -919,7 +934,7 @@ def health():
 
 if __name__ == '__main__':
     print("\n" + "="*70)
-    print("🚀 SEARCHABLE PDF CONVERTER - API SERVER (FIXED)")
+    print("🚀 SEARCHABLE PDF CONVERTER - API SERVER (FIXED v2)")
     print("="*70)
     print(f"📍 Server: http://localhost:5008")
     print(f"📍 Convert: POST http://localhost:5008/api/convert")
