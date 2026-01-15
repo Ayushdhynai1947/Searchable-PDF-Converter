@@ -1,4 +1,4 @@
-# app.py - Flask API for Searchable PDF Conversion
+# app.py - Flask API for Searchable PDF Conversion (OPTIMIZED)
 # Run with: python app.py
 # API endpoint: http://localhost:5008/api/convert
 
@@ -97,15 +97,29 @@ class SearchableDocumentConverter:
         logger.info(f"   ✅ Extracted {len(text_elements)} text elements")
         return result
 
-    def create_searchable_pdf_page(self, image_path: str, ocr_data: dict, output_buffer: io.BytesIO) -> io.BytesIO:
-        """Create a single PDF page with invisible text overlay"""
+    def create_searchable_pdf_page(self, image_path: str, ocr_data: dict, output_buffer: io.BytesIO, quality: int = 85) -> io.BytesIO:
+        """Create a single PDF page with invisible text overlay and COMPRESSED image"""
         image = Image.open(image_path)
+        
+        # Convert to RGB if needed
+        if image.mode != 'RGB':
+            image = image.convert('RGB')
+        
         img_width, img_height = image.size
+
+        # CRITICAL FIX: Compress image to JPEG in memory
+        img_buffer = io.BytesIO()
+        image.save(img_buffer, format='JPEG', quality=quality, optimize=True)
+        img_buffer.seek(0)
+        
+        # Use compressed image
+        compressed_image = Image.open(img_buffer)
 
         pdf_canvas = canvas.Canvas(output_buffer, pagesize=(img_width, img_height))
 
+        # Draw compressed image instead of original
         pdf_canvas.drawImage(
-            ImageReader(image),
+            ImageReader(compressed_image),
             0, 0,
             width=img_width,
             height=img_height,
@@ -168,7 +182,7 @@ class SearchableDocumentConverter:
         output_buffer.seek(0)
         return output_buffer
 
-    def convert_image_to_searchable_pdf(self, image_path: str, output_path: str) -> str:
+    def convert_image_to_searchable_pdf(self, image_path: str, output_path: str, quality: int = 85) -> str:
         """Convert a single image to searchable PDF"""
         logger.info("📄 Converting image to searchable PDF")
 
@@ -178,7 +192,7 @@ class SearchableDocumentConverter:
             logger.warning("⚠️  No text detected in image!")
 
         pdf_buffer = io.BytesIO()
-        self.create_searchable_pdf_page(image_path, ocr_data, pdf_buffer)
+        self.create_searchable_pdf_page(image_path, ocr_data, pdf_buffer, quality=quality)
 
         with open(output_path, 'wb') as f:
             f.write(pdf_buffer.getvalue())
@@ -186,8 +200,8 @@ class SearchableDocumentConverter:
         logger.info(f"✅ Conversion complete: {ocr_data['total_elements']} text elements")
         return str(output_path)
 
-    def convert_pdf_to_searchable_pdf(self, input_pdf_path: str, output_pdf_path: str, dpi: int = 300) -> str:
-        """Convert a scanned PDF to searchable PDF using PyMuPDF"""
+    def convert_pdf_to_searchable_pdf(self, input_pdf_path: str, output_pdf_path: str, dpi: int = 200, quality: int = 85) -> str:
+        """Convert a scanned PDF to searchable PDF using PyMuPDF with compression"""
         logger.info("📚 Converting PDF to searchable PDF")
 
         temp_folder = Path("temp_images")
@@ -197,7 +211,7 @@ class SearchableDocumentConverter:
         pdf_document = fitz.open(input_pdf_path)
         image_paths = []
         
-        # Convert zoom level based on DPI (default 72 DPI = zoom 1.0)
+        # REDUCED DPI for smaller file size (200 instead of 300)
         zoom = dpi / 72.0
 
         for page_num, page in enumerate(pdf_document, start=1):
@@ -207,9 +221,9 @@ class SearchableDocumentConverter:
             mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat, alpha=False)
             
-            # Save as PNG
-            img_path = temp_folder / f"page_{page_num}.png"
-            pix.save(str(img_path))
+            # Save as JPEG instead of PNG for smaller size
+            img_path = temp_folder / f"page_{page_num}.jpg"
+            pix.save(str(img_path), jpg_quality=quality)
             image_paths.append(str(img_path))
 
         pdf_document.close()
@@ -223,7 +237,7 @@ class SearchableDocumentConverter:
             ocr_data = self.extract_text_with_coordinates(img_path)
 
             page_buffer = io.BytesIO()
-            self.create_searchable_pdf_page(img_path, ocr_data, page_buffer)
+            self.create_searchable_pdf_page(img_path, ocr_data, page_buffer, quality=quality)
 
             page_reader = PdfReader(page_buffer)
             pdf_writer.add_page(page_reader.pages[0])
@@ -246,7 +260,7 @@ class SearchableDocumentConverter:
         logger.info(f"✅ PDF conversion complete: {len(image_paths)} pages")
         return str(output_pdf_path)
 
-    def convert_to_searchable(self, input_path: str, output_path: str, dpi: int = 300) -> str:
+    def convert_to_searchable(self, input_path: str, output_path: str, dpi: int = 200, quality: int = 85) -> str:
         """Universal converter - auto-detects input type"""
         input_file = Path(input_path)
 
@@ -256,9 +270,9 @@ class SearchableDocumentConverter:
         file_ext = input_file.suffix.lower()
 
         if file_ext in self.image_formats:
-            return self.convert_image_to_searchable_pdf(input_path, output_path)
+            return self.convert_image_to_searchable_pdf(input_path, output_path, quality=quality)
         elif file_ext in self.pdf_format:
-            return self.convert_pdf_to_searchable_pdf(input_path, output_path, dpi)
+            return self.convert_pdf_to_searchable_pdf(input_path, output_path, dpi=dpi, quality=quality)
         else:
             raise ValueError(f"Unsupported file format: {file_ext}")
 
@@ -312,7 +326,8 @@ def api_convert():
     
     Parameters:
         - file: The file to convert (PDF, PNG, JPG, TIFF)
-        - dpi: DPI for PDF conversion (optional, default: 300)
+        - dpi: DPI for PDF conversion (optional, default: 200)
+        - quality: JPEG quality 1-100 (optional, default: 85)
         
     Returns:
         - Searchable PDF file
@@ -334,18 +349,25 @@ def api_convert():
         input_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
         file.save(input_path)
         
-        # Get DPI setting
-        dpi = int(request.form.get('dpi', 300))
+        # Get settings (REDUCED defaults for smaller files)
+        dpi = int(request.form.get('dpi', 200))  # Changed from 300 to 200
+        quality = int(request.form.get('quality', 85))  # JPEG quality
+        
+        # Validate quality
+        quality = max(50, min(100, quality))
         
         # Generate output filename
         output_filename = f"{Path(filename).stem}_searchable.pdf"
         output_path = os.path.join(app.config['OUTPUT_FOLDER'], output_filename)
         
         # Convert to searchable PDF
-        logger.info(f"Converting: {filename} with DPI: {dpi}")
-        converter.convert_to_searchable(input_path, output_path, dpi=dpi)
+        logger.info(f"Converting: {filename} with DPI: {dpi}, Quality: {quality}")
+        converter.convert_to_searchable(input_path, output_path, dpi=dpi, quality=quality)
         
-        logger.info(f"✅ Conversion successful, sending file to client")
+        # Get file sizes for logging
+        input_size = os.path.getsize(input_path) / (1024 * 1024)
+        output_size = os.path.getsize(output_path) / (1024 * 1024)
+        logger.info(f"✅ Size: {input_size:.2f}MB → {output_size:.2f}MB")
         
         # Return the searchable PDF file
         return send_file(
@@ -395,6 +417,10 @@ def api_verify():
         
         verification = verify_pdf_searchable(temp_path)
         
+        # Add file size info
+        file_size_mb = os.path.getsize(temp_path) / (1024 * 1024)
+        verification['file_size_mb'] = round(file_size_mb, 2)
+        
         os.remove(temp_path)
         
         return jsonify(verification)
@@ -411,7 +437,9 @@ def health():
         'status': 'healthy',
         'ocr_models_loaded': True,
         'supported_formats': list(ALLOWED_EXTENSIONS),
-        'max_file_size_mb': app.config['MAX_CONTENT_LENGTH'] / (1024 * 1024)
+        'max_file_size_mb': app.config['MAX_CONTENT_LENGTH'] / (1024 * 1024),
+        'default_dpi': 200,
+        'default_quality': 85
     })
 
 
@@ -421,7 +449,7 @@ def health():
 
 if __name__ == '__main__':
     print("\n" + "="*70)
-    print("🚀 SEARCHABLE PDF CONVERTER - API SERVER")
+    print("🚀 SEARCHABLE PDF CONVERTER - API SERVER (OPTIMIZED)")
     print("="*70)
     print(f"📍 Server: http://localhost:5008")
     print(f"📍 Convert: POST http://localhost:5008/api/convert")
@@ -430,6 +458,8 @@ if __name__ == '__main__':
     print("="*70)
     print(f"📝 Max file size: {app.config['MAX_CONTENT_LENGTH'] / (1024 * 1024):.0f} MB")
     print(f"📁 Formats: {', '.join(ALLOWED_EXTENSIONS)}")
+    print(f"⚙️  Default DPI: 200 (was 300)")
+    print(f"⚙️  Default Quality: 85% JPEG")
     print("="*70)
     print("\nPress CTRL+C to stop the server\n")
     
