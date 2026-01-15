@@ -439,6 +439,7 @@
 # Run with: python app.py
 # API endpoint: http://localhost:5008/api/convert
 
+
 import os
 import logging
 from pathlib import Path
@@ -450,7 +451,6 @@ import fitz  # PyMuPDF
 from reportlab.pdfgen import canvas
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase import pdfmetrics
-from PyPDF2 import PdfReader, PdfWriter
 
 # Surya imports
 from surya.foundation import FoundationPredictor
@@ -595,7 +595,7 @@ class SearchableDocumentConverter:
                 pdf_y = img_height - y2  # Flip Y coordinate
 
                 # IMPROVED: Better font size calculation
-                # Use 80% of bbox height as a starting point
+                # Use 75% of bbox height as a starting point
                 font_size = max(6, min(72, bbox_height * 0.75))  # Min 6pt, Max 72pt
 
                 pdf_canvas.saveState()
@@ -662,67 +662,85 @@ class SearchableDocumentConverter:
         return str(output_path)
 
     def convert_pdf_to_searchable_pdf(self, input_pdf_path: str, output_pdf_path: str, dpi: int = 300) -> str:
-        """Convert a scanned PDF to searchable PDF using PyMuPDF"""
+        """Convert a scanned PDF to searchable PDF - FIXED NO DUPLICATES"""
         logger.info("📚 Converting PDF to searchable PDF")
 
         temp_folder = Path("temp_images")
         temp_folder.mkdir(exist_ok=True)
 
-        # Open PDF with PyMuPDF
+        # Open input PDF with PyMuPDF
         pdf_document = fitz.open(input_pdf_path)
-        image_paths = []
+        total_pages = len(pdf_document)
         
         # Convert zoom level based on DPI (default 72 DPI = zoom 1.0)
         zoom = dpi / 72.0
         
-        logger.info(f"📊 Using DPI: {dpi} (zoom: {zoom:.2f}x)")
+        logger.info(f"📊 Processing {total_pages} pages with DPI: {dpi} (zoom: {zoom:.2f}x)")
 
-        for page_num, page in enumerate(pdf_document, start=1):
-            logger.info(f"📄 Converting page {page_num}/{len(pdf_document)} to image...")
+        # Create a new empty PDF for output using PyMuPDF
+        output_pdf = fitz.open()
+
+        for page_num in range(total_pages):
+            logger.info(f"\n📄 Processing page {page_num + 1}/{total_pages}...")
+            
+            page = pdf_document[page_num]
             
             # Render page to image with proper DPI
             mat = fitz.Matrix(zoom, zoom)
             pix = page.get_pixmap(matrix=mat, alpha=False)
             
-            # Save as PNG
-            img_path = temp_folder / f"page_{page_num}.png"
+            # Save temporary image
+            img_path = temp_folder / f"page_{page_num + 1}.png"
             pix.save(str(img_path))
-            image_paths.append(str(img_path))
             
-            logger.info(f"   ✅ Saved image: {pix.width}x{pix.height} pixels")
+            logger.info(f"   ✅ Image created: {pix.width}x{pix.height} pixels")
 
-        pdf_document.close()
-        logger.info(f"✅ Converted {len(image_paths)} pages to images")
+            # Extract text with OCR
+            ocr_data = self.extract_text_with_coordinates(str(img_path))
 
-        pdf_writer = PdfWriter()
-
-        for page_num, img_path in enumerate(image_paths, start=1):
-            logger.info(f"📄 Processing page {page_num}/{len(image_paths)} for OCR...")
-
-            ocr_data = self.extract_text_with_coordinates(img_path)
-
+            # Create searchable PDF page with invisible text layer
             page_buffer = io.BytesIO()
-            self.create_searchable_pdf_page(img_path, ocr_data, page_buffer)
+            self.create_searchable_pdf_page(str(img_path), ocr_data, page_buffer)
 
-            page_reader = PdfReader(page_buffer)
-            pdf_writer.add_page(page_reader.pages[0])
+            # Load the created page and add to output PDF (ONE TIME ONLY)
+            page_buffer.seek(0)
+            temp_pdf = fitz.open("pdf", page_buffer.read())
+            
+            # Insert this single page into output
+            output_pdf.insert_pdf(temp_pdf, from_page=0, to_page=0)
+            
+            # Close temp PDF immediately
+            temp_pdf.close()
 
-        with open(output_pdf_path, 'wb') as output_file:
-            pdf_writer.write(output_file)
-
-        # Cleanup
-        for img_path in image_paths:
+            # Clean up temporary image immediately after processing
             try:
                 os.remove(img_path)
-            except:
-                pass
+                logger.info(f"   🗑️  Cleaned up temp image")
+            except Exception as e:
+                logger.warning(f"   ⚠️  Could not delete temp image: {e}")
 
+        # Save the final combined PDF
+        output_pdf.save(output_pdf_path)
+        output_pdf.close()
+        pdf_document.close()
+
+        # Cleanup temp folder
         try:
             temp_folder.rmdir()
         except:
             pass
 
-        logger.info(f"✅ PDF conversion complete: {len(image_paths)} pages")
+        logger.info(f"\n✅ PDF conversion complete: {total_pages} pages processed")
+        logger.info(f"📁 Output file: {output_pdf_path}")
+        
+        # Verify output
+        try:
+            verify_pdf = fitz.open(output_pdf_path)
+            logger.info(f"✅ Verification: Output PDF has {len(verify_pdf)} pages")
+            verify_pdf.close()
+        except Exception as e:
+            logger.error(f"⚠️  Could not verify output: {e}")
+        
         return str(output_pdf_path)
 
     def convert_to_searchable(self, input_path: str, output_path: str, dpi: int = 300) -> str:
@@ -754,18 +772,21 @@ def allowed_file(filename):
 
 
 def verify_pdf_searchable(pdf_path: str) -> dict:
-    """Verify if a PDF is searchable"""
+    """Verify if a PDF is searchable using PyMuPDF"""
     try:
-        reader = PdfReader(pdf_path)
+        pdf_doc = fitz.open(pdf_path)
         total_text = ""
-        for page in reader.pages:
-            total_text += page.extract_text()
+        
+        for page in pdf_doc:
+            total_text += page.get_text()
+        
+        pdf_doc.close()
 
         char_count = len(total_text.strip())
 
         return {
             'is_searchable': char_count > 10,
-            'total_pages': len(reader.pages),
+            'total_pages': len(pdf_doc),
             'total_characters': char_count,
             'preview': total_text[:300].strip() if char_count > 10 else ""
         }
@@ -820,6 +841,7 @@ def api_convert():
         if input_path and os.path.exists(input_path):
             try:
                 os.remove(input_path)
+                logger.info(f"Cleaned up input file: {input_path}")
             except Exception as e:
                 logger.warning(f"Could not delete input file: {e}")
 
